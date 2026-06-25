@@ -59,6 +59,45 @@ func TestParseRigImagesEnv(t *testing.T) {
 	})
 }
 
+func TestParseTmuxReadyTimeout(t *testing.T) {
+	t.Run("unset returns 60s default", func(t *testing.T) {
+		t.Setenv("GC_K8S_TMUX_READY_TIMEOUT", "")
+		d, err := parseTmuxReadyTimeout()
+		if err != nil {
+			t.Fatalf("parseTmuxReadyTimeout: %v", err)
+		}
+		if d != 60*time.Second {
+			t.Errorf("got %s, want 60s", d)
+		}
+	})
+	t.Run("valid duration parses", func(t *testing.T) {
+		t.Setenv("GC_K8S_TMUX_READY_TIMEOUT", "240s")
+		d, err := parseTmuxReadyTimeout()
+		if err != nil {
+			t.Fatalf("parseTmuxReadyTimeout: %v", err)
+		}
+		if d != 240*time.Second {
+			t.Errorf("got %s, want 240s", d)
+		}
+	})
+	t.Run("non-positive falls back to default", func(t *testing.T) {
+		t.Setenv("GC_K8S_TMUX_READY_TIMEOUT", "0s")
+		d, err := parseTmuxReadyTimeout()
+		if err != nil {
+			t.Fatalf("parseTmuxReadyTimeout: %v", err)
+		}
+		if d != 60*time.Second {
+			t.Errorf("got %s, want 60s", d)
+		}
+	})
+	t.Run("invalid duration errors", func(t *testing.T) {
+		t.Setenv("GC_K8S_TMUX_READY_TIMEOUT", "later")
+		if _, err := parseTmuxReadyTimeout(); err == nil {
+			t.Error("expected error for invalid duration, got nil")
+		}
+	})
+}
+
 func TestManagedServiceAliasDefaults(t *testing.T) {
 	t.Setenv("GC_DOLT_HOST", "canonical-dolt.example.com")
 	t.Setenv("GC_DOLT_PORT", "4407")

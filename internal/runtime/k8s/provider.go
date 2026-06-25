@@ -51,6 +51,7 @@ type Provider struct {
 	affinity           *corev1.Affinity    // GC_K8S_AFFINITY (JSON)
 	priorityClassName  string              // GC_K8S_PRIORITY_CLASS_NAME
 	postStartSettle    time.Duration       // settle time before post-start liveness check
+	tmuxReadyTimeout   time.Duration       // GC_K8S_TMUX_READY_TIMEOUT — wait window for tmux to appear
 	stderr             io.Writer           // warning output (default os.Stderr)
 }
 
@@ -70,6 +71,7 @@ type schedulingFields struct {
 //   - GC_K8S_SERVICE_ACCOUNT — pod service account name (default: namespace default)
 //   - GC_K8S_CPU_REQUEST, GC_K8S_MEM_REQUEST — resource requests
 //   - GC_K8S_CPU_LIMIT, GC_K8S_MEM_LIMIT — resource limits
+//   - GC_K8S_TMUX_READY_TIMEOUT — wait window for tmux to appear (default 60s)
 //
 // The in-cluster Dolt service alias defaults to the provider defaults
 // (dolt.gc.svc.cluster.local:3307). Pods receive projected GC_DOLT_* env;
@@ -108,6 +110,11 @@ func NewProvider() (*Provider, error) {
 		return nil, err
 	}
 
+	tmuxReadyTimeout, err := parseTmuxReadyTimeout()
+	if err != nil {
+		return nil, err
+	}
+
 	return &Provider{
 		ops: &realK8sOps{
 			clientset:  clientset,
@@ -127,6 +134,7 @@ func NewProvider() (*Provider, error) {
 		serviceAccount:     os.Getenv("GC_K8S_SERVICE_ACCOUNT"),
 		prebaked:           os.Getenv("GC_K8S_PREBAKED") == "true",
 		postStartSettle:    3 * time.Second,
+		tmuxReadyTimeout:   tmuxReadyTimeout,
 		stderr:             os.Stderr,
 		nodeSelector:       scheduling.nodeSelector,
 		tolerations:        scheduling.tolerations,
@@ -174,6 +182,29 @@ func parseRigImagesEnv() (map[string]string, error) {
 	return m, nil
 }
 
+// defaultTmuxReadyTimeout is the wait window for a pod's tmux session to appear.
+const defaultTmuxReadyTimeout = 60 * time.Second
+
+// parseTmuxReadyTimeout parses GC_K8S_TMUX_READY_TIMEOUT as a Go duration
+// (e.g. "240s", "4m"), defaulting to 60s when unset/empty/non-positive. The
+// window must cover a pod's pre_start work before tmux/claude appears — e.g. a
+// rig worktree-setup `git fetch && pull --rebase` on a large repo can exceed the
+// 60s default, after which the provider tears the otherwise-healthy pod down.
+func parseTmuxReadyTimeout() (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv("GC_K8S_TMUX_READY_TIMEOUT"))
+	if v == "" {
+		return defaultTmuxReadyTimeout, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("parsing GC_K8S_TMUX_READY_TIMEOUT: %w", err)
+	}
+	if d <= 0 {
+		return defaultTmuxReadyTimeout, nil
+	}
+	return d, nil
+}
+
 // newProviderWithOps creates a provider with a custom k8sOps (for testing).
 func newProviderWithOps(ops k8sOps) *Provider {
 	return &Provider{
@@ -186,6 +217,7 @@ func newProviderWithOps(ops k8sOps) *Provider {
 		memRequest:         "1Gi",
 		cpuLimit:           "2",
 		memLimit:           "4Gi",
+		tmuxReadyTimeout:   defaultTmuxReadyTimeout,
 		stderr:             io.Discard,
 	}
 }
@@ -282,7 +314,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 	}
 
 	// Wait for tmux session.
-	if err := waitForTmux(ctx, p.ops, podName, 60*time.Second); err != nil {
+	if err := waitForTmux(ctx, p.ops, podName, p.tmuxReadyTimeout); err != nil {
 		cleanup("tmux not ready")
 		return fmt.Errorf("waiting for tmux in pod %q: %w", podName, err)
 	}
