@@ -1855,6 +1855,92 @@ func TestStartAllowsOneShotLifecycleCommands(t *testing.T) {
 	}
 }
 
+// TestStartWaitsForReplReadyBeforeNudge is the regression guard for the k8s
+// nudge readiness gate: an interactive agent's startup nudge (the soul prompt)
+// MUST wait for claude's REPL prompt to appear before the send-keys, otherwise
+// the keystrokes land in the startup splash and are swallowed (the agent idles
+// blank). A regression that drops the poll fires the nudge on the first tick —
+// caught here by capCount < readyAfter and nudgedBeforeReady.
+func TestStartWaitsForReplReadyBeforeNudge(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	p.postStartSettle = 10 * time.Millisecond
+
+	const readyAfter = 3 // capture-pane shows the REPL prompt only on the 3rd poll
+	var capCount int
+	var nudgedBeforeReady bool
+	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		switch {
+		case len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "capture-pane":
+			capCount++
+			if capCount >= readyAfter {
+				// REPL ready: claude's prompt glyph at the start of a line.
+				return "doing setup\n❯ Try \"fix typecheck errors\"\n  bypass on", nil
+			}
+			// Still booting: splash only, no prompt.
+			return "Welcome to Claude Code\n1 plugin failed to install\nstarting...\n", nil
+		case len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "send-keys":
+			if capCount < readyAfter {
+				nudgedBeforeReady = true
+			}
+		}
+		return "", nil
+	}
+
+	cfg := runtime.Config{
+		Command:           "claude --dangerously-skip-permissions",
+		ReadyPromptPrefix: "❯ ", // interactive -> requiresPostStartLiveness -> poll runs
+		Nudge:             "Run gc prime to load your role.",
+	}
+	if err := p.Start(context.Background(), "gc-test-agent", cfg); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if capCount < readyAfter {
+		t.Fatalf("capture-pane polled %d times, want >= %d: the nudge must poll until the REPL prompt appears", capCount, readyAfter)
+	}
+	if nudgedBeforeReady {
+		t.Fatal("nudge send-keys fired before the REPL prompt appeared — the readiness gate was dropped")
+	}
+	var sawNudge bool
+	for _, c := range fake.calls {
+		if len(c.cmd) >= 6 && c.cmd[0] == "tmux" && c.cmd[1] == "send-keys" && c.cmd[4] == "-l" {
+			sawNudge = true
+		}
+	}
+	if !sawNudge {
+		t.Fatal("nudge was never delivered after the REPL became ready")
+	}
+}
+
+// TestWaitForReplReadyHonorsContextCancel proves the readiness poll is bounded:
+// when the prompt never appears it does not hang, it returns on ctx cancel (the
+// reconciler's deadline) rather than blocking the full nudgeReadyTimeout.
+func TestWaitForReplReadyHonorsContextCancel(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	fake.execFunc = func(_ string, _ []string) (string, error) {
+		return "still booting, no prompt\n", nil // never ready
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		p.waitForReplReady(ctx, "gc-test-agent", runtime.Config{ReadyPromptPrefix: "❯ "})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitForReplReady did not return on context cancellation — poll is unbounded")
+	}
+}
+
 func TestStartChecksLivenessForScriptCommandWithoutOneShotLifecycle(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)
