@@ -405,8 +405,16 @@ const (
 	// start (model-resolve + plugin/PATH setup) can exceed the fixed
 	// postStartSettle under boot load, so a fixed delay races the splash and the
 	// send-keys is swallowed. nudgeReadyPoll is the inter-poll interval.
-	nudgeReadyTimeout = 30 * time.Second
-	nudgeReadyPoll    = 300 * time.Millisecond
+	nudgeReadyTimeout = 45 * time.Second
+	nudgeReadyPoll    = 500 * time.Millisecond
+	// nudgeReadyStablePolls is how many CONSECUTIVE captures must show the prompt
+	// with UNCHANGED pane content before we treat claude as truly input-ready. The
+	// prompt glyph alone is a false-ready signal: claude renders its input box
+	// during the welcome/splash, but a submit (Enter) sent then is swallowed and the
+	// typed text is cleared when the welcome screen dismisses — so the nudge is lost.
+	// Requiring the pane to settle (no startup churn between polls) is what makes the
+	// send-keys actually submit. Mirrors the tmux adapter's WaitForIdle 2-poll rule.
+	nudgeReadyStablePolls = 2
 	// k8sDefaultReadyPromptPrefix mirrors tmux DefaultReadyPromptPrefix — claude's
 	// REPL prompt glyph (U+276F). Used when cfg.ReadyPromptPrefix is unset.
 	k8sDefaultReadyPromptPrefix = "❯"
@@ -416,31 +424,42 @@ const (
 	readyProbePaneLines = 120
 )
 
-// waitForReplReady polls the pod's tmux pane for the runtime ready prompt
-// (cfg.ReadyPromptPrefix, default claude's "❯") so the soul nudge lands in the
-// REPL rather than racing claude's startup splash — k8s parity with the tmux
-// adapter's WaitForRuntimeReady. Best-effort: returns as soon as the prompt is
-// seen, or when nudgeReadyTimeout / ctx elapses (the caller nudges regardless,
-// so a never-ready agent is no worse off than before — just not nudged early).
+// waitForReplReady polls the pod's tmux pane until the runtime prompt
+// (cfg.ReadyPromptPrefix, default claude's "❯") is present AND the pane has
+// settled (unchanged for nudgeReadyStablePolls consecutive captures), so the
+// soul nudge lands in a REPL that will actually submit it rather than racing
+// claude's startup splash — k8s parity with the tmux adapter's readiness gate.
+// Stability matters because the prompt glyph appears before claude can process a
+// submit; a nudge sent then is typed but never submitted (or cleared by the
+// welcome dismiss). Best-effort: returns when settled, or when nudgeReadyTimeout
+// / ctx elapses (the caller nudges regardless, so a never-ready agent is no worse
+// off than before — just not nudged early).
 func (p *Provider) waitForReplReady(ctx context.Context, podName string, cfg runtime.Config) {
 	prefix := strings.TrimSpace(cfg.ReadyPromptPrefix)
 	if prefix == "" {
 		prefix = k8sDefaultReadyPromptPrefix
 	}
 	deadline := time.Now().Add(nudgeReadyTimeout)
+	var prev string
+	stable := 0
 	for {
 		out, err := p.ops.execInPod(ctx, podName, "agent",
 			[]string{"tmux", "capture-pane", "-p", "-t", tmuxSession, "-S",
 				"-" + strconv.Itoa(readyProbePaneLines)}, nil)
 		if err == nil {
-			for _, line := range strings.Split(out, "\n") {
-				trimmed := strings.TrimSpace(line)
-				// Tolerate a box-drawing left border ("│ ❯ …") some TUIs render.
-				trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "│"))
-				if strings.HasPrefix(trimmed, prefix) {
-					return
+			if paneHasPrompt(out, prefix) {
+				if out == prev {
+					stable++
+					if stable >= nudgeReadyStablePolls {
+						return
+					}
+				} else {
+					stable = 0
 				}
+			} else {
+				stable = 0
 			}
+			prev = out
 		}
 		if time.Now().After(deadline) {
 			return
@@ -451,6 +470,19 @@ func (p *Provider) waitForReplReady(ctx context.Context, podName string, cfg run
 		case <-time.After(nudgeReadyPoll):
 		}
 	}
+}
+
+// paneHasPrompt reports whether any captured line begins with the ready prompt
+// prefix (tolerating a leading box-drawing border that some TUIs render).
+func paneHasPrompt(pane, prefix string) bool {
+	for _, line := range strings.Split(pane, "\n") {
+		trimmed := strings.TrimSpace(line)
+		trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "│"))
+		if strings.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // Relaunch re-launches the agent inside the already-running (warm) pod without

@@ -1857,31 +1857,43 @@ func TestStartAllowsOneShotLifecycleCommands(t *testing.T) {
 
 // TestStartWaitsForReplReadyBeforeNudge is the regression guard for the k8s
 // nudge readiness gate: an interactive agent's startup nudge (the soul prompt)
-// MUST wait for claude's REPL prompt to appear before the send-keys, otherwise
-// the keystrokes land in the startup splash and are swallowed (the agent idles
-// blank). A regression that drops the poll fires the nudge on the first tick —
-// caught here by capCount < readyAfter and nudgedBeforeReady.
+// MUST wait for claude's REPL to be present AND settled before the send-keys.
+// The prompt glyph alone is a FALSE-ready signal — claude renders its input box
+// during the welcome/splash, but a submit sent then is swallowed and the typed
+// text cleared (the agent idles blank). The fake here shows: (1) splash with no
+// prompt, (2) the prompt present but the pane CHANGING (startup churn), then (3)
+// the pane settled. The nudge must fire only in phase (3). A regression that
+// drops the poll (fires immediately) or drops the stability check (fires during
+// churn) is caught by promptVisibleSinceCap vs nudgeFiredAtCap.
 func TestStartWaitsForReplReadyBeforeNudge(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)
 	p.postStartSettle = 10 * time.Millisecond
 
-	const readyAfter = 3 // capture-pane shows the REPL prompt only on the 3rd poll
 	var capCount int
-	var nudgedBeforeReady bool
+	promptVisibleSinceCap := 0
+	nudgeFiredAtCap := 0
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
 		switch {
 		case len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "capture-pane":
 			capCount++
-			if capCount >= readyAfter {
-				// REPL ready: claude's prompt glyph at the start of a line.
-				return "doing setup\n❯ Try \"fix typecheck errors\"\n  bypass on", nil
+			switch {
+			case capCount <= 2:
+				return "Welcome to Claude Code\nstarting...\n", nil // no prompt
+			case capCount <= 4:
+				// Prompt present but the pane is still churning (plugin/PATH/model
+				// messages) — NOT settled. Each capture differs.
+				if promptVisibleSinceCap == 0 {
+					promptVisibleSinceCap = capCount
+				}
+				return fmt.Sprintf("❯ Try \"x\"\ninstalling plugin %d\n", capCount), nil
+			default:
+				// Settled: prompt present, pane identical across captures.
+				return "❯ Try \"fix typecheck errors\"\n  bypass on", nil
 			}
-			// Still booting: splash only, no prompt.
-			return "Welcome to Claude Code\n1 plugin failed to install\nstarting...\n", nil
 		case len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "send-keys":
-			if capCount < readyAfter {
-				nudgedBeforeReady = true
+			if nudgeFiredAtCap == 0 {
+				nudgeFiredAtCap = capCount
 			}
 		}
 		return "", nil
@@ -1895,20 +1907,27 @@ func TestStartWaitsForReplReadyBeforeNudge(t *testing.T) {
 	if err := p.Start(context.Background(), "gc-test-agent", cfg); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if capCount < readyAfter {
-		t.Fatalf("capture-pane polled %d times, want >= %d: the nudge must poll until the REPL prompt appears", capCount, readyAfter)
+	if nudgeFiredAtCap == 0 {
+		t.Fatal("nudge was never delivered")
 	}
-	if nudgedBeforeReady {
-		t.Fatal("nudge send-keys fired before the REPL prompt appeared — the readiness gate was dropped")
+	if promptVisibleSinceCap == 0 {
+		t.Fatal("test setup: prompt never became visible")
 	}
-	var sawNudge bool
+	// The prompt was visible from cap 3, but the pane only settles at cap 5+.
+	// A correct gate fires after settle (>= 6); a regression that drops stability
+	// fires while churning (3..5); one that drops the poll entirely fires at <= 3.
+	if nudgeFiredAtCap <= promptVisibleSinceCap+1 {
+		t.Fatalf("nudge fired at capture %d (prompt first visible at %d) — fired during startup churn; the stability gate was dropped",
+			nudgeFiredAtCap, promptVisibleSinceCap)
+	}
+	var sawLiteralNudge bool
 	for _, c := range fake.calls {
 		if len(c.cmd) >= 6 && c.cmd[0] == "tmux" && c.cmd[1] == "send-keys" && c.cmd[4] == "-l" {
-			sawNudge = true
+			sawLiteralNudge = true
 		}
 	}
-	if !sawNudge {
-		t.Fatal("nudge was never delivered after the REPL became ready")
+	if !sawLiteralNudge {
+		t.Fatal("nudge text was never delivered after the REPL settled")
 	}
 }
 
