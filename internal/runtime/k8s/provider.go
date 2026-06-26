@@ -354,8 +354,15 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		}
 	}
 
-	// Send initial nudge if configured (matches tmux adapter step 6).
+	// Send initial nudge if configured (matches tmux adapter step 6). For an
+	// interactive (managed-startup) agent, wait for the REPL prompt first so the
+	// keystrokes land in claude rather than its startup splash — the fixed
+	// postStartSettle alone races claude's cold start under load. One-shot scripts
+	// have no REPL prompt, so skip the poll and nudge immediately as before.
 	if cfg.Nudge != "" {
+		if requiresPostStartLiveness {
+			p.waitForReplReady(ctx, podName, cfg)
+		}
 		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
 	}
 
@@ -388,6 +395,60 @@ func (p *Provider) runPodPostLaunchSetup(ctx context.Context, podName string, cf
 		} else {
 			_, _ = p.ops.execInPod(ctx, podName, "agent",
 				[]string{"sh"}, strings.NewReader(string(script)))
+		}
+	}
+}
+
+const (
+	// nudgeReadyTimeout bounds how long Start/Relaunch poll the pod's tmux pane
+	// for the runtime ready prompt before sending the soul nudge. claude's cold
+	// start (model-resolve + plugin/PATH setup) can exceed the fixed
+	// postStartSettle under boot load, so a fixed delay races the splash and the
+	// send-keys is swallowed. nudgeReadyPoll is the inter-poll interval.
+	nudgeReadyTimeout = 30 * time.Second
+	nudgeReadyPoll    = 300 * time.Millisecond
+	// k8sDefaultReadyPromptPrefix mirrors tmux DefaultReadyPromptPrefix — claude's
+	// REPL prompt glyph (U+276F). Used when cfg.ReadyPromptPrefix is unset.
+	k8sDefaultReadyPromptPrefix = "❯"
+	// readyProbePaneLines matches the tmux adapter's promptObservationLines:
+	// claude's welcome/idle UI leaves blank rows below the prompt, so capturing
+	// only the footer can miss a perfectly visible prompt.
+	readyProbePaneLines = 120
+)
+
+// waitForReplReady polls the pod's tmux pane for the runtime ready prompt
+// (cfg.ReadyPromptPrefix, default claude's "❯") so the soul nudge lands in the
+// REPL rather than racing claude's startup splash — k8s parity with the tmux
+// adapter's WaitForRuntimeReady. Best-effort: returns as soon as the prompt is
+// seen, or when nudgeReadyTimeout / ctx elapses (the caller nudges regardless,
+// so a never-ready agent is no worse off than before — just not nudged early).
+func (p *Provider) waitForReplReady(ctx context.Context, podName string, cfg runtime.Config) {
+	prefix := strings.TrimSpace(cfg.ReadyPromptPrefix)
+	if prefix == "" {
+		prefix = k8sDefaultReadyPromptPrefix
+	}
+	deadline := time.Now().Add(nudgeReadyTimeout)
+	for {
+		out, err := p.ops.execInPod(ctx, podName, "agent",
+			[]string{"tmux", "capture-pane", "-p", "-t", tmuxSession, "-S",
+				"-" + strconv.Itoa(readyProbePaneLines)}, nil)
+		if err == nil {
+			for _, line := range strings.Split(out, "\n") {
+				trimmed := strings.TrimSpace(line)
+				// Tolerate a box-drawing left border ("│ ❯ …") some TUIs render.
+				trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "│"))
+				if strings.HasPrefix(trimmed, prefix) {
+					return
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(nudgeReadyPoll):
 		}
 	}
 }
@@ -453,6 +514,9 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 	}
 
 	if cfg.Nudge != "" {
+		if k8sRequiresPostStartLiveness(cfg) {
+			p.waitForReplReady(ctx, podName, cfg)
+		}
 		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
 	}
 	return nil
