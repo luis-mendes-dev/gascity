@@ -1960,6 +1960,52 @@ func TestWaitForReplReadyHonorsContextCancel(t *testing.T) {
 	}
 }
 
+// TestDeliverNudgeRetriesUntilSubmitted is the regression guard for the submit
+// fix: claude's TUI drops an Enter sent right after a large paste, so the nudge
+// must be (re)submitted until it actually takes. The fake here keeps the nudge
+// text buffered in the input line (unsubmitted) until the 2nd Enter, then shows
+// the agent processing. deliverNudge must type once, then retry Enter until the
+// prompt clears — a regression that submits once-and-forgets leaves it buffered.
+func TestDeliverNudgeRetriesUntilSubmitted(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	nudge := "Run gc prime to load your role and work the queue."
+
+	var pasteCount, enterCount int
+	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if len(cmd) >= 5 && cmd[0] == "tmux" && cmd[1] == "send-keys" {
+			switch cmd[4] {
+			case "-l":
+				pasteCount++
+			case "Enter":
+				enterCount++
+			}
+			return "", nil
+		}
+		if len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "capture-pane" {
+			if enterCount >= 2 {
+				// Submitted: input cleared, agent processing.
+				return "working on it\n❯ \n  esc to interrupt", nil
+			}
+			// Still buffered: the nudge text sits in the input prompt line.
+			return "❯ " + nudge + "\n  bypass on", nil
+		}
+		return "", nil
+	}
+
+	p.deliverNudge(context.Background(), "gc-test-agent", runtime.Config{Nudge: nudge})
+
+	if pasteCount != 1 {
+		t.Fatalf("nudge text pasted %d times, want exactly 1", pasteCount)
+	}
+	if enterCount < 2 {
+		t.Fatalf("Enter sent %d times, want >= 2 — the submit must retry until it takes", enterCount)
+	}
+	if enterCount > nudgeSubmitAttempts {
+		t.Fatalf("Enter sent %d times, exceeded the %d-attempt cap (should stop once submitted)", enterCount, nudgeSubmitAttempts)
+	}
+}
+
 func TestStartChecksLivenessForScriptCommandWithoutOneShotLifecycle(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)

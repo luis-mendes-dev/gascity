@@ -355,15 +355,17 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 	}
 
 	// Send initial nudge if configured (matches tmux adapter step 6). For an
-	// interactive (managed-startup) agent, wait for the REPL prompt first so the
-	// keystrokes land in claude rather than its startup splash — the fixed
-	// postStartSettle alone races claude's cold start under load. One-shot scripts
-	// have no REPL prompt, so skip the poll and nudge immediately as before.
+	// interactive (managed-startup) agent, wait for the REPL prompt+settle, then
+	// deliverNudge (paste, settle, submit-with-retry) so the soul nudge actually
+	// SUBMITS — a back-to-back paste+Enter into claude's TUI drops the Enter and
+	// leaves the agent blank. One-shot scripts have no REPL, so nudge as before.
 	if cfg.Nudge != "" {
 		if requiresPostStartLiveness {
 			p.waitForReplReady(ctx, podName, cfg)
+			p.deliverNudge(ctx, podName, cfg)
+		} else {
+			_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
 		}
-		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
 	}
 
 	return nil
@@ -485,6 +487,87 @@ func paneHasPrompt(pane, prefix string) bool {
 	return false
 }
 
+const (
+	// nudgeSubmitPasteDelay is the pause between typing the nudge text and the
+	// submit Enter. claude's TUI drops an Enter that arrives immediately after a
+	// large literal paste (a back-to-back send-keys -l + Enter) — the text lands
+	// in the input box but never submits and is cleared when the welcome banner
+	// dismisses, leaving the agent blank. A short settle lets the paste register.
+	nudgeSubmitPasteDelay = 600 * time.Millisecond
+	// nudgeSubmitAttempts bounds how many times we (re)send Enter, verifying after
+	// each that the prompt actually submitted (claude can still drop a lone Enter).
+	nudgeSubmitAttempts = 4
+	// nudgeSubmitVerifyDelay is how long to wait after an Enter before checking
+	// whether the prompt submitted.
+	nudgeSubmitVerifyDelay = 1500 * time.Millisecond
+	// nudgeHeadRunes is how many leading runes of the nudge to look for in the
+	// input line when checking whether it is still buffered (not yet submitted).
+	nudgeHeadRunes = 20
+)
+
+// deliverNudge types the nudge text into the pod's tmux pane, then submits it,
+// verifying the submit actually took and re-pressing Enter if not. The caller
+// must already have waited for the REPL to be ready+settled (waitForReplReady).
+// Splitting the paste from the Enter (with a settle between) and verifying is
+// what makes the soul nudge reliably submit on k8s — claude drops an Enter sent
+// immediately after a large paste, so the text sits unsubmitted and is lost.
+// Best-effort: on exec error or ctx done it returns (no worse than the old
+// fire-and-forget path).
+func (p *Provider) deliverNudge(ctx context.Context, podName string, cfg runtime.Config) {
+	// Type the literal text (no Enter yet).
+	if _, err := p.ops.execInPod(ctx, podName, "agent",
+		[]string{"tmux", "send-keys", "-t", tmuxSession, "-l", cfg.Nudge}, nil); err != nil {
+		return
+	}
+	for attempt := 0; attempt < nudgeSubmitAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(nudgeSubmitPasteDelay):
+		}
+		if _, err := p.ops.execInPod(ctx, podName, "agent",
+			[]string{"tmux", "send-keys", "-t", tmuxSession, "Enter"}, nil); err != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(nudgeSubmitVerifyDelay):
+		}
+		out, err := p.ops.execInPod(ctx, podName, "agent",
+			[]string{"tmux", "capture-pane", "-p", "-t", tmuxSession, "-S",
+				"-" + strconv.Itoa(readyProbePaneLines)}, nil)
+		if err == nil && nudgeSubmitted(out, cfg.Nudge) {
+			return
+		}
+	}
+}
+
+// nudgeSubmitted reports whether the nudge appears to have been submitted: either
+// the agent is now processing (a "working" indicator is present) or the nudge
+// text is no longer buffered in the input prompt line.
+func nudgeSubmitted(pane, nudge string) bool {
+	if strings.Contains(pane, "esc to interrupt") {
+		return true
+	}
+	head := strings.TrimSpace(nudge)
+	if r := []rune(head); len(r) > nudgeHeadRunes {
+		head = string(r[:nudgeHeadRunes])
+	}
+	if head == "" {
+		return true
+	}
+	// A prompt line still showing the start of the nudge means it is buffered in
+	// the input box, not yet submitted.
+	for _, line := range strings.Split(pane, "\n") {
+		t := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "│"))
+		if strings.HasPrefix(t, "❯") && strings.Contains(t, head) {
+			return false
+		}
+	}
+	return true
+}
+
 // Relaunch re-launches the agent inside the already-running (warm) pod without
 // recreating it: it respawns the in-pod tmux "main" pane (respawn-pane -k) with
 // the (possibly changed) command over execInPod, then re-runs the post-launch
@@ -548,8 +631,10 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 	if cfg.Nudge != "" {
 		if k8sRequiresPostStartLiveness(cfg) {
 			p.waitForReplReady(ctx, podName, cfg)
+			p.deliverNudge(ctx, podName, cfg)
+		} else {
+			_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
 		}
-		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
 	}
 	return nil
 }
