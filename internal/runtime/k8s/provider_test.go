@@ -1871,6 +1871,7 @@ func TestStartWaitsForReplReadyBeforeNudge(t *testing.T) {
 	p.postStartSettle = 10 * time.Millisecond
 
 	var capCount int
+	var enterSent bool
 	promptVisibleSinceCap := 0
 	nudgeFiredAtCap := 0
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
@@ -1878,6 +1879,9 @@ func TestStartWaitsForReplReadyBeforeNudge(t *testing.T) {
 		case len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "capture-pane":
 			capCount++
 			switch {
+			case enterSent:
+				// Submitted: agent now processing (lets deliverNudge stop).
+				return "working\n❯ \n  esc to interrupt", nil
 			case capCount <= 2:
 				return "Welcome to Claude Code\nstarting...\n", nil // no prompt
 			case capCount <= 4:
@@ -1892,8 +1896,11 @@ func TestStartWaitsForReplReadyBeforeNudge(t *testing.T) {
 				return "❯ Try \"fix typecheck errors\"\n  bypass on", nil
 			}
 		case len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "send-keys":
-			if nudgeFiredAtCap == 0 {
+			if len(cmd) >= 5 && cmd[4] == "-l" && nudgeFiredAtCap == 0 {
 				nudgeFiredAtCap = capCount
+			}
+			if len(cmd) >= 5 && cmd[4] == "Enter" {
+				enterSent = true
 			}
 		}
 		return "", nil
@@ -1960,13 +1967,15 @@ func TestWaitForReplReadyHonorsContextCancel(t *testing.T) {
 	}
 }
 
-// TestDeliverNudgeRetriesUntilSubmitted is the regression guard for the submit
-// fix: claude's TUI drops an Enter sent right after a large paste, so the nudge
-// must be (re)submitted until it actually takes. The fake here keeps the nudge
-// text buffered in the input line (unsubmitted) until the 2nd Enter, then shows
-// the agent processing. deliverNudge must type once, then retry Enter until the
-// prompt clears — a regression that submits once-and-forgets leaves it buffered.
-func TestDeliverNudgeRetriesUntilSubmitted(t *testing.T) {
+// TestDeliverNudgeRetriesUntilProcessing is the regression guard for the submit
+// fix. On k8s the nudge can fail two ways: claude drops an Enter right after a
+// large paste (text buffered, unsubmitted), or a startup interstitial swallows
+// the paste (input left empty). An empty input is NOT proof of submission, so
+// deliverNudge verifies POSITIVELY (the "processing" marker) and re-types +
+// re-submits each attempt until the agent is actually working. The fake here
+// stays idle until the 2nd Enter, then shows processing. A regression that
+// submits-once or treats empty-input as success is caught by the counts.
+func TestDeliverNudgeRetriesUntilProcessing(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)
 	nudge := "Run gc prime to load your role and work the queue."
@@ -1984,25 +1993,25 @@ func TestDeliverNudgeRetriesUntilSubmitted(t *testing.T) {
 		}
 		if len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "capture-pane" {
 			if enterCount >= 2 {
-				// Submitted: input cleared, agent processing.
+				// Submitted: agent processing.
 				return "working on it\n❯ \n  esc to interrupt", nil
 			}
-			// Still buffered: the nudge text sits in the input prompt line.
-			return "❯ " + nudge + "\n  bypass on", nil
+			// Idle: empty input, NOT processing (mimics an eaten paste too).
+			return "❯ \n  bypass on", nil
 		}
 		return "", nil
 	}
 
 	p.deliverNudge(context.Background(), "gc-test-agent", runtime.Config{Nudge: nudge})
 
-	if pasteCount != 1 {
-		t.Fatalf("nudge text pasted %d times, want exactly 1", pasteCount)
-	}
 	if enterCount < 2 {
-		t.Fatalf("Enter sent %d times, want >= 2 — the submit must retry until it takes", enterCount)
+		t.Fatalf("Enter sent %d times, want >= 2 — the submit must retry until the agent is processing", enterCount)
+	}
+	if pasteCount < 2 {
+		t.Fatalf("nudge pasted %d times, want >= 2 — each attempt must re-type (an eaten paste leaves the input empty)", pasteCount)
 	}
 	if enterCount > nudgeSubmitAttempts {
-		t.Fatalf("Enter sent %d times, exceeded the %d-attempt cap (should stop once submitted)", enterCount, nudgeSubmitAttempts)
+		t.Fatalf("Enter sent %d times, exceeded the %d-attempt cap (should stop once processing)", enterCount, nudgeSubmitAttempts)
 	}
 }
 
