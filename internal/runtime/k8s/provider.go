@@ -354,9 +354,18 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		}
 	}
 
-	// Send initial nudge if configured (matches tmux adapter step 6).
+	// Send initial nudge if configured (matches tmux adapter step 6). For an
+	// interactive (managed-startup) agent, wait for the REPL prompt+settle, then
+	// deliverNudge (paste, settle, submit-with-retry) so the soul nudge actually
+	// SUBMITS — a back-to-back paste+Enter into claude's TUI drops the Enter and
+	// leaves the agent blank. One-shot scripts have no REPL, so nudge as before.
 	if cfg.Nudge != "" {
-		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
+		if requiresPostStartLiveness {
+			p.waitForReplReady(ctx, podName, cfg)
+			p.deliverNudge(ctx, podName, cfg)
+		} else {
+			_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
+		}
 	}
 
 	return nil
@@ -389,6 +398,194 @@ func (p *Provider) runPodPostLaunchSetup(ctx context.Context, podName string, cf
 			_, _ = p.ops.execInPod(ctx, podName, "agent",
 				[]string{"sh"}, strings.NewReader(string(script)))
 		}
+	}
+}
+
+const (
+	// nudgeReadyTimeout bounds how long Start/Relaunch poll the pod's tmux pane
+	// for the runtime ready prompt before sending the soul nudge. claude's cold
+	// start (model-resolve + plugin/PATH setup) can exceed the fixed
+	// postStartSettle under boot load, so a fixed delay races the splash and the
+	// send-keys is swallowed. nudgeReadyPoll is the inter-poll interval.
+	nudgeReadyTimeout = 45 * time.Second
+	nudgeReadyPoll    = 500 * time.Millisecond
+	// nudgeReadyStablePolls is how many CONSECUTIVE captures must show the prompt
+	// with UNCHANGED pane content before we treat claude as truly input-ready. The
+	// prompt glyph alone is a false-ready signal: claude renders its input box
+	// during the welcome/splash, but a submit (Enter) sent then is swallowed and the
+	// typed text is cleared when the welcome screen dismisses — so the nudge is lost.
+	// Requiring the pane to settle (no startup churn between polls) is what makes the
+	// send-keys actually submit. Mirrors the tmux adapter's WaitForIdle 2-poll rule.
+	nudgeReadyStablePolls = 2
+	// k8sDefaultReadyPromptPrefix mirrors tmux DefaultReadyPromptPrefix — claude's
+	// REPL prompt glyph (U+276F). Used when cfg.ReadyPromptPrefix is unset.
+	k8sDefaultReadyPromptPrefix = "❯"
+	// readyProbePaneLines matches the tmux adapter's promptObservationLines:
+	// claude's welcome/idle UI leaves blank rows below the prompt, so capturing
+	// only the footer can miss a perfectly visible prompt.
+	readyProbePaneLines = 120
+)
+
+// waitForReplReady polls the pod's tmux pane until the runtime prompt
+// (cfg.ReadyPromptPrefix, default claude's "❯") is present AND the pane has
+// settled (unchanged for nudgeReadyStablePolls consecutive captures), so the
+// soul nudge lands in a REPL that will actually submit it rather than racing
+// claude's startup splash — k8s parity with the tmux adapter's readiness gate.
+// Stability matters because the prompt glyph appears before claude can process a
+// submit; a nudge sent then is typed but never submitted (or cleared by the
+// welcome dismiss). Best-effort: returns when settled, or when nudgeReadyTimeout
+// / ctx elapses (the caller nudges regardless, so a never-ready agent is no worse
+// off than before — just not nudged early).
+func (p *Provider) waitForReplReady(ctx context.Context, podName string, cfg runtime.Config) {
+	prefix := strings.TrimSpace(cfg.ReadyPromptPrefix)
+	if prefix == "" {
+		prefix = k8sDefaultReadyPromptPrefix
+	}
+	deadline := time.Now().Add(nudgeReadyTimeout)
+	var prev string
+	stable := 0
+	for {
+		out, err := p.ops.execInPod(ctx, podName, "agent",
+			[]string{"tmux", "capture-pane", "-p", "-t", tmuxSession, "-S",
+				"-" + strconv.Itoa(readyProbePaneLines)}, nil)
+		if err == nil {
+			if paneHasPrompt(out, prefix) {
+				if out == prev {
+					stable++
+					if stable >= nudgeReadyStablePolls {
+						return
+					}
+				} else {
+					stable = 0
+				}
+			} else {
+				stable = 0
+			}
+			prev = out
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(nudgeReadyPoll):
+		}
+	}
+}
+
+// paneHasPrompt reports whether any captured line begins with the ready prompt
+// prefix (tolerating a leading box-drawing border that some TUIs render).
+func paneHasPrompt(pane, prefix string) bool {
+	for _, line := range strings.Split(pane, "\n") {
+		trimmed := strings.TrimSpace(line)
+		trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "│"))
+		if strings.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+const (
+	// nudgeBufferName is the tmux buffer used to bracketed-paste the nudge.
+	nudgeBufferName = "gc-nudge"
+	// nudgePasteSettle is the pause after the bracketed paste before submitting, so
+	// the (possibly large, multi-line) paste fully registers in the input box.
+	nudgePasteSettle = 800 * time.Millisecond
+	// nudgeSubmitAttempts bounds how many times we (re)send Enter, verifying after
+	// each that the agent started processing. A detached pane can drop the submit
+	// key; re-waking + re-Entering lands it (observed: ~4 Enters on a real pod).
+	nudgeSubmitAttempts = 6
+	// nudgeSubmitVerifyDelay is how long to wait after an Enter before checking
+	// whether the agent started processing the submitted prompt.
+	nudgeSubmitVerifyDelay = 1800 * time.Millisecond
+	// nudgePaneWakeSettle is the pause inside the SIGWINCH wake jiggle.
+	nudgePaneWakeSettle = 60 * time.Millisecond
+	// nudgeProcessingMarker is claude's "working" footer — present only while it
+	// processes a submitted prompt. Its appearance is the positive proof the nudge
+	// submitted (an empty input is NOT proof — a dropped submit also leaves it empty).
+	nudgeProcessingMarker = "esc to interrupt"
+)
+
+// deliverNudge delivers the (often large, multi-line) startup nudge into the
+// pod's tmux pane and submits it, mirroring the local tmux NudgeSession — the
+// clean-room-validated sequence (proven on a live mayor pod). The caller must
+// already have waited for the REPL to be ready+settled (waitForReplReady).
+//
+// Why not send-keys -l + Enter: the nudge is the agent's full soul prompt
+// (prompt_mode=none prepends it), tens of KB and multi-line; send-keys -l sends
+// each embedded newline as a submit, fragmenting it. And a pool pod's tmux is
+// DETACHED (no client), so its TUI may not service input/submit until a SIGWINCH
+// wakes the event loop. So: wake the pane, BRACKETED-paste the text as one paste
+// (load-buffer via stdin handles arbitrary size), settle, wake, then submit —
+// re-waking + re-Entering until the agent is verifiably processing.
+// Best-effort: on exec error or ctx done it returns (no worse than fire-and-forget).
+func (p *Provider) deliverNudge(ctx context.Context, podName string, cfg runtime.Config) {
+	if p.agentProcessing(ctx, podName) {
+		return
+	}
+	// Wake the detached pane so its input loop is live, then bracketed-paste the
+	// nudge as a single paste operation (-p), loading the literal text via stdin.
+	p.wakePane(ctx, podName)
+	if _, err := p.ops.execInPod(ctx, podName, "agent",
+		[]string{"tmux", "load-buffer", "-b", nudgeBufferName, "-"},
+		strings.NewReader(cfg.Nudge)); err != nil {
+		return
+	}
+	if _, err := p.ops.execInPod(ctx, podName, "agent",
+		[]string{"tmux", "paste-buffer", "-p", "-d", "-b", nudgeBufferName, "-t", tmuxSession}, nil); err != nil {
+		return
+	}
+	if nudgeWait(ctx, nudgePasteSettle) {
+		return
+	}
+	// Submit with retry: a detached pane can drop the Enter; wake + re-Enter until
+	// the agent is verifiably processing the prompt.
+	for attempt := 0; attempt < nudgeSubmitAttempts; attempt++ {
+		p.wakePane(ctx, podName)
+		if _, err := p.ops.execInPod(ctx, podName, "agent",
+			[]string{"tmux", "send-keys", "-t", tmuxSession, "Enter"}, nil); err != nil {
+			return
+		}
+		if nudgeWait(ctx, nudgeSubmitVerifyDelay) {
+			return
+		}
+		if p.agentProcessing(ctx, podName) {
+			return
+		}
+	}
+}
+
+// wakePane jiggles the pane size (down 1 row, up 1 row) to force a SIGWINCH,
+// waking a detached TUI's event loop so it services pasted input / the submit
+// key. Mirrors the local tmux WakePane. Best-effort.
+func (p *Provider) wakePane(ctx context.Context, podName string) {
+	_, _ = p.ops.execInPod(ctx, podName, "agent",
+		[]string{"tmux", "resize-pane", "-t", tmuxSession, "-y", "-1"}, nil)
+	if nudgeWait(ctx, nudgePaneWakeSettle) {
+		return
+	}
+	_, _ = p.ops.execInPod(ctx, podName, "agent",
+		[]string{"tmux", "resize-pane", "-t", tmuxSession, "-y", "+1"}, nil)
+}
+
+// agentProcessing reports whether the agent's pane shows the working indicator,
+// i.e. it submitted and is processing a prompt.
+func (p *Provider) agentProcessing(ctx context.Context, podName string) bool {
+	out, err := p.ops.execInPod(ctx, podName, "agent",
+		[]string{"tmux", "capture-pane", "-p", "-t", tmuxSession, "-S",
+			"-" + strconv.Itoa(readyProbePaneLines)}, nil)
+	return err == nil && strings.Contains(out, nudgeProcessingMarker)
+}
+
+// nudgeWait sleeps for d unless ctx is canceled; returns true if ctx was canceled.
+func nudgeWait(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	case <-time.After(d):
+		return false
 	}
 }
 
@@ -453,7 +650,12 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 	}
 
 	if cfg.Nudge != "" {
-		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
+		if k8sRequiresPostStartLiveness(cfg) {
+			p.waitForReplReady(ctx, podName, cfg)
+			p.deliverNudge(ctx, podName, cfg)
+		} else {
+			_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
+		}
 	}
 	return nil
 }

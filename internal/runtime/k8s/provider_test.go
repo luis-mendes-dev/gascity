@@ -1855,6 +1855,170 @@ func TestStartAllowsOneShotLifecycleCommands(t *testing.T) {
 	}
 }
 
+// TestStartWaitsForReplReadyBeforeNudge is the regression guard for the k8s
+// nudge readiness gate: an interactive agent's startup nudge (the soul prompt)
+// MUST wait for claude's REPL to be present AND settled before the send-keys.
+// The prompt glyph alone is a FALSE-ready signal — claude renders its input box
+// during the welcome/splash, but a submit sent then is swallowed and the typed
+// text cleared (the agent idles blank). The fake here shows: (1) splash with no
+// prompt, (2) the prompt present but the pane CHANGING (startup churn), then (3)
+// the pane settled. The nudge must fire only in phase (3). A regression that
+// drops the poll (fires immediately) or drops the stability check (fires during
+// churn) is caught by promptVisibleSinceCap vs nudgeFiredAtCap.
+func TestStartWaitsForReplReadyBeforeNudge(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	p.postStartSettle = 10 * time.Millisecond
+
+	var capCount int
+	var enterSent bool
+	promptVisibleSinceCap := 0
+	nudgeFiredAtCap := 0
+	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		switch {
+		case len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "capture-pane":
+			capCount++
+			switch {
+			case enterSent:
+				// Submitted: agent now processing (lets deliverNudge stop).
+				return "working\n❯ \n  esc to interrupt", nil
+			case capCount <= 2:
+				return "Welcome to Claude Code\nstarting...\n", nil // no prompt
+			case capCount <= 4:
+				// Prompt present but the pane is still churning (plugin/PATH/model
+				// messages) — NOT settled. Each capture differs.
+				if promptVisibleSinceCap == 0 {
+					promptVisibleSinceCap = capCount
+				}
+				return fmt.Sprintf("❯ Try \"x\"\ninstalling plugin %d\n", capCount), nil
+			default:
+				// Settled: prompt present, pane identical across captures.
+				return "❯ Try \"fix typecheck errors\"\n  bypass on", nil
+			}
+		case len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "paste-buffer":
+			if nudgeFiredAtCap == 0 {
+				nudgeFiredAtCap = capCount // the nudge is bracketed-pasted, not typed
+			}
+		case len(cmd) >= 5 && cmd[0] == "tmux" && cmd[1] == "send-keys" && cmd[4] == "Enter":
+			enterSent = true
+		}
+		return "", nil
+	}
+
+	cfg := runtime.Config{
+		Command:           "claude --dangerously-skip-permissions",
+		ReadyPromptPrefix: "❯ ", // interactive -> requiresPostStartLiveness -> poll runs
+		Nudge:             "Run gc prime to load your role.",
+	}
+	if err := p.Start(context.Background(), "gc-test-agent", cfg); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if nudgeFiredAtCap == 0 {
+		t.Fatal("nudge was never delivered")
+	}
+	if promptVisibleSinceCap == 0 {
+		t.Fatal("test setup: prompt never became visible")
+	}
+	// The prompt was visible from cap 3, but the pane only settles at cap 5+.
+	// A correct gate fires after settle (>= 6); a regression that drops stability
+	// fires while churning (3..5); one that drops the poll entirely fires at <= 3.
+	if nudgeFiredAtCap <= promptVisibleSinceCap+1 {
+		t.Fatalf("nudge fired at capture %d (prompt first visible at %d) — fired during startup churn; the stability gate was dropped",
+			nudgeFiredAtCap, promptVisibleSinceCap)
+	}
+	var sawBracketedPaste bool
+	for _, c := range fake.calls {
+		if len(c.cmd) >= 2 && c.cmd[0] == "tmux" && c.cmd[1] == "paste-buffer" {
+			sawBracketedPaste = true
+		}
+	}
+	if !sawBracketedPaste {
+		t.Fatal("nudge was never bracketed-pasted after the REPL settled")
+	}
+}
+
+// TestWaitForReplReadyHonorsContextCancel proves the readiness poll is bounded:
+// when the prompt never appears it does not hang, it returns on ctx cancel (the
+// reconciler's deadline) rather than blocking the full nudgeReadyTimeout.
+func TestWaitForReplReadyHonorsContextCancel(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	fake.execFunc = func(_ string, _ []string) (string, error) {
+		return "still booting, no prompt\n", nil // never ready
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		p.waitForReplReady(ctx, "gc-test-agent", runtime.Config{ReadyPromptPrefix: "❯ "})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitForReplReady did not return on context cancellation — poll is unbounded")
+	}
+}
+
+// TestDeliverNudgeBracketedPasteAndRetriesSubmit is the regression guard for the
+// proven delivery (mirrors local tmux NudgeSession): the nudge is delivered via
+// load-buffer + bracketed paste-buffer ONCE (send-keys -l fragments a multi-line
+// soul on newlines), then the submit Enter is retried — a detached pane drops the
+// first Enter(s) until a SIGWINCH wake lands it. The fake stays idle until the
+// 2nd Enter, then shows processing. Caught: dropping bracketed paste, or
+// submit-once, or treating empty input as success.
+func TestDeliverNudgeBracketedPasteAndRetriesSubmit(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	nudge := "soul line one\nsoul line two\n\n---\n\nRun gc prime to load your role."
+
+	var loadBufCount, pasteBufCount, literalSendKeys, enterCount int
+	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if len(cmd) >= 2 && cmd[0] == "tmux" {
+			switch cmd[1] {
+			case "load-buffer":
+				loadBufCount++
+			case "paste-buffer":
+				pasteBufCount++
+			case "send-keys":
+				if len(cmd) >= 5 && cmd[4] == "-l" {
+					literalSendKeys++
+				}
+				if len(cmd) >= 5 && cmd[4] == "Enter" {
+					enterCount++
+				}
+			case "capture-pane":
+				if enterCount >= 2 {
+					return "working on it\n❯ \n  esc to interrupt", nil // processing
+				}
+				return "❯ \n  bypass on", nil // idle, submit not yet landed
+			}
+		}
+		return "", nil
+	}
+
+	p.deliverNudge(context.Background(), "gc-test-agent", runtime.Config{Nudge: nudge})
+
+	if loadBufCount != 1 || pasteBufCount != 1 {
+		t.Fatalf("load-buffer=%d paste-buffer=%d, want 1 each (bracketed paste once)", loadBufCount, pasteBufCount)
+	}
+	if literalSendKeys != 0 {
+		t.Fatalf("send-keys -l used %d times — must NOT type a multi-line nudge literally", literalSendKeys)
+	}
+	if enterCount < 2 {
+		t.Fatalf("Enter sent %d times, want >= 2 — the submit must retry until the agent is processing", enterCount)
+	}
+	if enterCount > nudgeSubmitAttempts {
+		t.Fatalf("Enter sent %d times, exceeded the %d-attempt cap (should stop once processing)", enterCount, nudgeSubmitAttempts)
+	}
+}
+
 func TestStartChecksLivenessForScriptCommandWithoutOneShotLifecycle(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)
@@ -1988,8 +2152,21 @@ func TestStartSendsNudge(t *testing.T) {
 	p := newProviderWithOps(fake)
 	p.postStartSettle = 0
 
-	fake.setExecResult("gc-test-agent",
-		[]string{"tmux", "has-session", "-t", "main"}, "", nil)
+	// The fake shows a settled REPL prompt (so waitForReplReady returns), then the
+	// processing marker once Enter is sent (so deliverNudge stops).
+	var enterSent bool
+	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "capture-pane" {
+			if enterSent {
+				return "working\n  esc to interrupt", nil
+			}
+			return "❯ ready\n  bypass on", nil
+		}
+		if len(cmd) == 5 && cmd[0] == "tmux" && cmd[1] == "send-keys" && cmd[4] == "Enter" {
+			enterSent = true
+		}
+		return "", nil
+	}
 
 	cfg := runtime.Config{
 		Command: "claude --settings .gc/settings.json",
@@ -2004,27 +2181,36 @@ func TestStartSendsNudge(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	// Verify nudge was sent via tmux send-keys.
-	var foundText, foundEnter bool
+	// Verify the nudge was delivered via bracketed paste (load-buffer + paste-buffer)
+	// and submitted with Enter — NOT typed with send-keys -l (which fragments a
+	// multi-line nudge).
+	var foundLoad, foundPaste, foundEnter, foundLiteral bool
 	for _, c := range fake.calls {
-		if c.method != "execInPod" {
+		if c.method != "execInPod" || len(c.cmd) < 2 || c.cmd[0] != "tmux" {
 			continue
 		}
-		if len(c.cmd) >= 6 && c.cmd[0] == "tmux" && c.cmd[1] == "send-keys" && c.cmd[4] == "-l" {
-			foundText = true
-			if c.cmd[5] != cfg.Nudge {
-				t.Errorf("nudge text = %q, want %q", c.cmd[5], cfg.Nudge)
+		switch c.cmd[1] {
+		case "load-buffer":
+			foundLoad = true
+		case "paste-buffer":
+			foundPaste = true
+		case "send-keys":
+			if len(c.cmd) >= 5 && c.cmd[4] == "Enter" {
+				foundEnter = true
+			}
+			if len(c.cmd) >= 5 && c.cmd[4] == "-l" {
+				foundLiteral = true
 			}
 		}
-		if len(c.cmd) == 5 && c.cmd[0] == "tmux" && c.cmd[1] == "send-keys" && c.cmd[4] == "Enter" {
-			foundEnter = true
-		}
 	}
-	if !foundText {
-		t.Error("Start did not send nudge text via tmux send-keys")
+	if !foundLoad || !foundPaste {
+		t.Error("Start did not bracketed-paste the nudge (expected tmux load-buffer + paste-buffer)")
 	}
 	if !foundEnter {
-		t.Error("Start did not send Enter after nudge text")
+		t.Error("Start did not send Enter to submit the nudge")
+	}
+	if foundLiteral {
+		t.Error("Start typed the nudge with send-keys -l — must use bracketed paste")
 	}
 }
 
