@@ -1128,6 +1128,20 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		if trace != nil {
 			trace.recordDecision("reconciler.session.pending_create", templateName, name, action, "rollback", nil, nil, "")
 		}
+		// Reclaim the runtime before rolling back. A failed/stale pending-create
+		// may have already created a k8s pod whose `sleep infinity` entrypoint
+		// keeps it Running even though the agent never came up — rollback closes
+		// the bead but never deletes that pod, leaking one orphan per recycle
+		// until the k8s client-side rate limiter (QPS) starves the reconciler
+		// (the control-dispatcher pool-pod leak). rollbackPendingCreate also
+		// clears session_name, so Stop here first, using the name the caller
+		// captured. Best-effort + idempotent (NotFound → no-op): safe on every
+		// provider and when no pod was ever created.
+		if name != "" {
+			if stopErr := sp.Stop(name); stopErr != nil {
+				fmt.Fprintf(stderr, "session reconciler: stopping runtime for rolled-back create %s: %v\n", name, stopErr) //nolint:errcheck
+			}
+		}
 		if clearClaim {
 			rollbackPendingCreateClearingClaim(session, store, clk.Now().UTC(), stderr)
 			return
@@ -2552,6 +2566,22 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				closeReason = "drained"
 			}
 			if closeBead(store, target.session.ID, closeReason, clk.Now().UTC(), stderr) {
+				// Tear the runtime down on close. alive=false means gc's
+				// liveness probe found no live agent (tmux/REPL gone), but on
+				// k8s the pod's `sleep infinity` entrypoint keeps the POD
+				// Running after its tmux/agent dies — so closeBead retires the
+				// bead while the orphaned pod lingers forever, leaking one pod
+				// per pool recycle until the k8s client-side rate limiter (QPS)
+				// starves the reconciler (observed: control-dispatcher pool
+				// churn → dozens of orphan pods → reconcile stall). Stop()
+				// deletes the pod by the session's unique gc-session label;
+				// it is best-effort + idempotent (a genuinely-gone runtime
+				// NotFound's to a no-op), so it is safe on every provider.
+				if name := strings.TrimSpace(target.session.Metadata["session_name"]); name != "" {
+					if stopErr := sp.Stop(name); stopErr != nil {
+						fmt.Fprintf(stderr, "session reconciler: stopping runtime for closed pool session %s: %v\n", name, stopErr) //nolint:errcheck
+					}
+				}
 				// Pool worktrees are transient by design — reclaim disk
 				// when the session bead is retired. Skipped under safety
 				// gates (uncommitted, unpushed, stashed) and overridable
