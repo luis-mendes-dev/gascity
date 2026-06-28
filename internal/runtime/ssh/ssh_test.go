@@ -172,9 +172,17 @@ func TestTmuxCarrierDrivesOverSSH(t *testing.T) {
 	if err := carrier.Nudge(context.Background(), "s", runtime.TextContent("hello")); err != nil {
 		t.Fatalf("Nudge: %v", err)
 	}
+	// Detached-pane reliability: SIGWINCH resize-wake before the type and before
+	// the Enter, plus a final wake — all driven as remote argv over ssh.
 	want := [][]string{
+		{"tmux", "resize-pane", "-t", "main", "-y", "-1"},
+		{"tmux", "resize-pane", "-t", "main", "-y", "+1"},
 		{"tmux", "send-keys", "-t", "main", "-l", "hello"},
+		{"tmux", "resize-pane", "-t", "main", "-y", "-1"},
+		{"tmux", "resize-pane", "-t", "main", "-y", "+1"},
 		{"tmux", "send-keys", "-t", "main", "Enter"},
+		{"tmux", "resize-pane", "-t", "main", "-y", "-1"},
+		{"tmux", "resize-pane", "-t", "main", "-y", "+1"},
 	}
 	if len(f.calls) != len(want) {
 		t.Fatalf("remote argv calls = %v, want %v", f.calls, want)

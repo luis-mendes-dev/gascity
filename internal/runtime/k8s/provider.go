@@ -358,12 +358,14 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 	// interactive (managed-startup) agent, wait for the REPL prompt+settle, then
 	// deliverNudge (paste, settle, submit-with-retry) so the soul nudge actually
 	// SUBMITS — a back-to-back paste+Enter into claude's TUI drops the Enter and
-	// leaves the agent blank. One-shot scripts have no REPL, so nudge as before.
+	// leaves the agent blank. One-shot scripts have no REPL to submit to, so skip
+	// the nudge — the now-reliable carrier Nudge (wake + Enter-retry) would
+	// otherwise block Start ~0.5s on a delivery that has no effect.
 	if cfg.Nudge != "" {
 		if requiresPostStartLiveness {
 			p.waitForReplReady(ctx, podName, cfg)
 			p.deliverNudge(ctx, podName, cfg)
-		} else {
+		} else if cfg.Lifecycle != runtime.LifecycleOneShot {
 			_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
 		}
 	}
@@ -653,7 +655,10 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 		if k8sRequiresPostStartLiveness(cfg) {
 			p.waitForReplReady(ctx, podName, cfg)
 			p.deliverNudge(ctx, podName, cfg)
-		} else {
+		} else if cfg.Lifecycle != runtime.LifecycleOneShot {
+			// Non-interactive but not one-shot: deliver via the carrier. One-shot
+			// scripts have no TUI to submit to, so skip (the reliable carrier Nudge
+			// would otherwise block Start ~0.5s for nothing).
 			_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
 		}
 	}

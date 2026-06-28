@@ -165,12 +165,20 @@ func TestProvider_NudgeDrivesNamedTmuxTarget(t *testing.T) {
 	if err := p.Nudge("sess-7", runtime.TextContent("hi")); err != nil {
 		t.Fatalf("Nudge: %v", err)
 	}
+	// Detached-pane reliability: SIGWINCH resize-wake before the type and before
+	// the Enter, plus a final wake. resize -1/+1 is a net-zero wake-dance.
 	want := [][]string{
+		{"tmux", "resize-pane", "-t", "sess-7", "-y", "-1"},
+		{"tmux", "resize-pane", "-t", "sess-7", "-y", "+1"},
 		{"tmux", "send-keys", "-t", "sess-7", "-l", "hi"},
+		{"tmux", "resize-pane", "-t", "sess-7", "-y", "-1"},
+		{"tmux", "resize-pane", "-t", "sess-7", "-y", "+1"},
 		{"tmux", "send-keys", "-t", "sess-7", "Enter"},
+		{"tmux", "resize-pane", "-t", "sess-7", "-y", "-1"},
+		{"tmux", "resize-pane", "-t", "sess-7", "-y", "+1"},
 	}
-	if len(f.calls) != 2 {
-		t.Fatalf("calls = %v, want 2", f.calls)
+	if len(f.calls) != len(want) {
+		t.Fatalf("calls = %v, want %d", f.calls, len(want))
 	}
 	for i := range want {
 		if !slices.Equal(f.calls[i], want[i]) {

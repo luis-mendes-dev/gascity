@@ -55,9 +55,18 @@ func TestTmuxCarrier_NudgeTypesThenSubmits(t *testing.T) {
 	if err := c.Nudge(context.Background(), "s", TextContent("hi there")); err != nil {
 		t.Fatalf("Nudge: %v", err)
 	}
+	// Detached-pane reliability: SIGWINCH resize-wake before the type, type the
+	// literal text, wake again, submit Enter (first attempt succeeds here), then a
+	// final wake to process the turn. resize -1/+1 is a net-zero wake-dance.
 	wantExec(t, f,
+		"tmux resize-pane -t main -y -1",
+		"tmux resize-pane -t main -y +1",
 		"tmux send-keys -t main -l hi there",
+		"tmux resize-pane -t main -y -1",
+		"tmux resize-pane -t main -y +1",
 		"tmux send-keys -t main Enter",
+		"tmux resize-pane -t main -y -1",
+		"tmux resize-pane -t main -y +1",
 	)
 }
 
@@ -130,25 +139,34 @@ func TestTmuxCarrier_NudgeMessageIsASingleArg(t *testing.T) {
 	if err := c.Nudge(context.Background(), "s", TextContent("hi there friend")); err != nil {
 		t.Fatalf("Nudge: %v", err)
 	}
-	if len(rec.calls) != 2 {
-		t.Fatalf("got %d exec calls, want 2", len(rec.calls))
+	// 8 calls now: wake(2) + type(1) + wake(2) + Enter(1) + wake(2). The type is
+	// the 3rd call (index 2), after the pre-send wake-dance.
+	if len(rec.calls) != 8 {
+		t.Fatalf("got %d exec calls, want 8", len(rec.calls))
 	}
 	want := []string{"tmux", "send-keys", "-t", "main", "-l", "hi there friend"}
-	if !slices.Equal(rec.calls[0], want) {
-		t.Errorf("first argv = %v, want %v (message must be one element)", rec.calls[0], want)
+	if !slices.Equal(rec.calls[2], want) {
+		t.Errorf("type argv = %v, want %v (message must be one element)", rec.calls[2], want)
 	}
 }
 
 func TestTmuxCarrier_NudgeFirstStepErrorSkipsEnter(t *testing.T) {
-	// A type failure surfaces the error and skips the Enter submit.
+	// A type failure surfaces the error and skips the Enter submit. The pre-send
+	// wake-dance is best-effort (errors ignored), so on a fully-broken transport
+	// the calls are: wake(2, ignored) + the failing type(1) = 3, and NO Enter.
 	rec := &recordingExec{err: errBoom}
 	c := NewTmuxCarrier(rec, "main")
 	err := c.Nudge(context.Background(), "s", TextContent("hi"))
 	if !errors.Is(err, errBoom) {
 		t.Fatalf("Nudge err = %v, want errBoom", err)
 	}
-	if len(rec.calls) != 1 {
-		t.Errorf("issued %d exec calls, want 1 (Enter must be skipped after the type fails)", len(rec.calls))
+	if len(rec.calls) != 3 {
+		t.Errorf("issued %d exec calls, want 3 (wake-dance + failed type; Enter skipped)", len(rec.calls))
+	}
+	for _, call := range rec.calls {
+		if slices.Contains(call, "Enter") {
+			t.Errorf("Enter must be skipped after the type fails; saw %v", call)
+		}
 	}
 }
 

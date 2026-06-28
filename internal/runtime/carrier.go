@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"strconv"
+	"time"
 )
 
 // Carrier drives the high-level session interactions — input delivery, output
@@ -76,14 +77,45 @@ func (c *tmuxCarrier) Nudge(ctx context.Context, name string, content []ContentB
 	if message == "" {
 		return nil
 	}
-	// Type the literal text, then submit — the two-step send-keys the k8s
-	// provider uses (a single send-keys would interpret the text as key names).
-	// If typing fails, the error surfaces and Enter is skipped: the caller
-	// learns delivery failed (the pane may hold a half-typed, unsubmitted line).
+	// The box runs the agent TUI in a tmux pane that is typically DETACHED (no
+	// client attached — the norm for k8s pods and pooled SSH boxes). A detached
+	// TUI may not service its render/input loop until a terminal event occurs, so
+	// a bare `send-keys -l <text>` + `send-keys Enter` is delivered by tmux but
+	// silently dropped at the application layer — leaving a half-typed, UNSUBMITTED
+	// line in the pane (the agent then idles on its own queued command, e.g. an
+	// un-run `gc hook`). Mirror the local tmux NudgeSession reliability: fire a
+	// SIGWINCH resize-dance to wake the pane before the type AND before the submit,
+	// debounce so the paste settles, and retry the Enter — the submit is the step
+	// that most often fails on a detached pane. resize -1 then +1 is net-zero, so
+	// it is harmless for attached panes too.
+	wake := func() {
+		_, _ = c.tmux(ctx, name, "resize-pane", "-t", c.target, "-y", "-1")
+		time.Sleep(50 * time.Millisecond)
+		_, _ = c.tmux(ctx, name, "resize-pane", "-t", c.target, "-y", "+1")
+	}
+
+	wake()
+	// Type the literal text (a single send-keys would interpret it as key names).
 	if _, err := c.tmux(ctx, name, "send-keys", "-t", c.target, "-l", message); err != nil {
 		return err
 	}
-	_, err := c.tmux(ctx, name, "send-keys", "-t", c.target, "Enter")
+	// Let the paste settle, then wake again so the pane is servicing input when
+	// Enter arrives.
+	time.Sleep(300 * time.Millisecond)
+	wake()
+	// Send Enter with retry — the critical submit step on a detached pane. Only
+	// retries on a transport error; a successful Enter returns immediately (no
+	// double-submit).
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
+		if _, err = c.tmux(ctx, name, "send-keys", "-t", c.target, "Enter"); err == nil {
+			wake() // process the submitted turn promptly
+			return nil
+		}
+	}
 	return err
 }
 
