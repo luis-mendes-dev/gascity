@@ -363,40 +363,68 @@ func TestListRunning(t *testing.T) {
 	}
 }
 
+// TestNudge / NudgeNow regression guard: a runtime nudge (the controller's
+// automatic wait-idle/immediate agent follow-ups) must be delivered via the
+// robust bracketed-paste + verified-submit path, NOT carrier send-keys -l. The
+// nudge carries a MULTI-LINE <system-reminder> wrapper; send-keys -l would send
+// each embedded newline as a submit, fragmenting it and leaving the last line
+// unsubmitted (the hands-off stall this fix closes). The fake reports the
+// processing marker once Enter has landed so the submit loop exits promptly.
 func TestNudge(t *testing.T) {
-	fake := newFakeK8sOps()
-	p := newProviderWithOps(fake)
+	for _, tc := range []struct {
+		name string
+		send func(p *Provider) error
+	}{
+		{"Nudge", func(p *Provider) error {
+			return p.Nudge("gc-test-agent", runtime.TextContent("line one\nline two"))
+		}},
+		{"NudgeNow", func(p *Provider) error {
+			return p.NudgeNow("gc-test-agent", runtime.TextContent("line one\nline two"))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeK8sOps()
+			p := newProviderWithOps(fake)
+			addRunningPod(fake, "gc-test-agent", "gc-test-agent")
 
-	addRunningPod(fake, "gc-test-agent", "gc-test-agent")
+			var loadBuf, pasteBuf, literalSendKeys, enter int
+			fake.execFunc = func(_ string, cmd []string) (string, error) {
+				if len(cmd) >= 2 && cmd[0] == "tmux" {
+					switch cmd[1] {
+					case "load-buffer":
+						loadBuf++
+					case "paste-buffer":
+						pasteBuf++
+					case "send-keys":
+						if len(cmd) >= 5 && cmd[4] == "-l" {
+							literalSendKeys++
+						}
+						if len(cmd) >= 5 && cmd[4] == "Enter" {
+							enter++
+						}
+					case "capture-pane":
+						if enter >= 1 {
+							return "❯ \n  esc to interrupt", nil // processing
+						}
+						return "❯ \n  bypass on", nil // idle, not yet submitted
+					}
+				}
+				return "", nil
+			}
 
-	err := p.Nudge("gc-test-agent", runtime.TextContent("hello world"))
-	if err != nil {
-		t.Fatalf("Nudge: %v", err)
-	}
-
-	// Verify exec was called with literal mode:
-	// Call 1: ["tmux", "send-keys", "-t", "main", "-l", "hello world"]
-	// Call 2: ["tmux", "send-keys", "-t", "main", "Enter"]
-	foundLiteral := false
-	foundEnter := false
-	for _, c := range fake.calls {
-		if c.method != "execInPod" {
-			continue
-		}
-		if len(c.cmd) >= 6 && c.cmd[0] == "tmux" && c.cmd[1] == "send-keys" &&
-			c.cmd[4] == "-l" && c.cmd[5] == "hello world" {
-			foundLiteral = true
-		}
-		if len(c.cmd) >= 5 && c.cmd[0] == "tmux" && c.cmd[1] == "send-keys" &&
-			c.cmd[4] == "Enter" {
-			foundEnter = true
-		}
-	}
-	if !foundLiteral {
-		t.Error("no tmux send-keys -l call recorded for Nudge")
-	}
-	if !foundEnter {
-		t.Error("no tmux send-keys Enter call recorded for Nudge")
+			if err := tc.send(p); err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if loadBuf != 1 || pasteBuf != 1 {
+				t.Fatalf("load-buffer=%d paste-buffer=%d, want 1 each (bracketed paste once)", loadBuf, pasteBuf)
+			}
+			if literalSendKeys != 0 {
+				t.Fatalf("send-keys -l used %d times — must NOT type a multi-line nudge literally", literalSendKeys)
+			}
+			if enter < 1 {
+				t.Fatalf("no submit Enter recorded for %s", tc.name)
+			}
+		})
 	}
 }
 

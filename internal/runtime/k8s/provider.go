@@ -25,8 +25,9 @@ import (
 
 // Compile-time interface checks.
 var (
-	_ runtime.Provider     = (*Provider)(nil)
-	_ runtime.ExecProvider = (*Provider)(nil)
+	_ runtime.Provider               = (*Provider)(nil)
+	_ runtime.ExecProvider           = (*Provider)(nil)
+	_ runtime.ImmediateNudgeProvider = (*Provider)(nil)
 )
 
 // Provider is a native Kubernetes session provider using client-go.
@@ -527,12 +528,34 @@ func (p *Provider) deliverNudge(ctx context.Context, podName string, cfg runtime
 	if p.agentProcessing(ctx, podName) {
 		return
 	}
+	p.deliverNudgeText(ctx, podName, cfg.Nudge)
+}
+
+// deliverNudgeText bracketed-pastes text into the pod's tmux pane and submits it
+// with wake + positive-verify retry — the clean-room-validated sequence shared by
+// the startup nudge (deliverNudge) and the runtime nudge paths (Nudge/NudgeNow).
+//
+// Why this and not the carrier's send-keys -l + Enter: runtime nudges (the
+// controller's automatic agent follow-ups — gc prime, push pr, drain-ack) are
+// delivered as a multi-line <system-reminder> wrapper. send-keys -l sends each
+// embedded newline as a submit, so a multi-line message is fragmented and the
+// final line is left typed-but-UNSUBMITTED in the pane — the exact "frozen
+// half-typed line" stall that blocks hands-off. Bracketed-paste loads the whole
+// (multi-line) message as a single input, then ONE submit ends the turn. The
+// detached pane can still drop the Enter at the app layer (it returns transport
+// success regardless), so submit with wake + re-Enter until the agent is
+// verifiably processing (the "esc to interrupt" marker), not just until tmux
+// accepts the keystroke. Best-effort: on exec error / ctx done it returns.
+func (p *Provider) deliverNudgeText(ctx context.Context, podName, text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
 	// Wake the detached pane so its input loop is live, then bracketed-paste the
 	// nudge as a single paste operation (-p), loading the literal text via stdin.
 	p.wakePane(ctx, podName)
 	if _, err := p.ops.execInPod(ctx, podName, "agent",
 		[]string{"tmux", "load-buffer", "-b", nudgeBufferName, "-"},
-		strings.NewReader(cfg.Nudge)); err != nil {
+		strings.NewReader(text)); err != nil {
 		return
 	}
 	if _, err := p.ops.execInPod(ctx, podName, "agent",
@@ -557,6 +580,20 @@ func (p *Provider) deliverNudge(ctx context.Context, podName string, cfg runtime
 			return
 		}
 	}
+}
+
+// deliverNudgeToSession resolves the running pod for a session and delivers text
+// via the robust bracketed-paste + verify path. Best-effort: no running pod
+// (session gone / not yet up) is a no-op, matching the carrier's swallow policy.
+func (p *Provider) deliverNudgeToSession(ctx context.Context, name, text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	podName, err := p.findRunningPod(ctx, name)
+	if err != nil {
+		return
+	}
+	p.deliverNudgeText(ctx, podName, text)
 }
 
 // wakePane jiggles the pane size (down 1 row, up 1 row) to force a SIGWINCH,
@@ -792,11 +829,25 @@ func (p *Provider) ProcessAlive(name string, processNames []string) bool {
 	return false
 }
 
-// Nudge types a message into the tmux session followed by Enter.
-// Uses -l (literal mode) so tmux key names in the message text are not
-// interpreted as keystrokes. Content blocks are flattened to text.
+// Nudge delivers a message to the tmux session and submits it. Content blocks
+// are flattened to text. Uses the robust bracketed-paste + wake + positive-verify
+// submit path (deliverNudgeToSession) rather than the carrier's send-keys -l so
+// that MULTI-LINE messages (the <system-reminder> wrapper the controller's
+// automatic wait-idle/immediate nudges carry) are pasted as one input and submit
+// exactly once — send-keys -l would treat each embedded newline as a submit,
+// fragmenting the message and leaving its final line unsubmitted (the hands-off
+// stall). Best-effort, matching the carrier swallow policy.
 func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
-	_ = p.carrier().Nudge(context.Background(), name, content) // best-effort
+	p.deliverNudgeToSession(context.Background(), name, runtime.FlattenText(content))
+	return nil
+}
+
+// NudgeNow delivers a message immediately without the manager's wait-idle
+// heuristic. On k8s the robust delivery already wakes the detached pane and
+// positive-verifies the submit, so immediate and wait-idle share the same
+// reliable path; satisfies runtime.ImmediateNudgeProvider.
+func (p *Provider) NudgeNow(name string, content []runtime.ContentBlock) error {
+	p.deliverNudgeToSession(context.Background(), name, runtime.FlattenText(content))
 	return nil
 }
 
